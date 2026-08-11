@@ -23,7 +23,8 @@ import collections as c
 import xipppy as xp
 
 from Ripple_USB_Finder_SUPPORT import Ripple_USBFinder
-from Ripple_Signal_Acquisition import RippleController, RippleThread
+from Ripple_Signal_Acquisition import RippleController
+from Ripple_Signal_Thread_SUPPORT import RippleThread
 from Ripple_Signal_Filtering_SUPPORT import SignalProcessor
 from Ripple_Settings_SUPPORT  import *
 
@@ -102,9 +103,7 @@ class RippleGUI(QMainWindow):
         self.Reg_data_Label.setAlignment(Qt.AlignCenter)
         self.left_layout.addWidget(self.Reg_data_Label)
 
-        # Stream-type selector. Populated for real from the hardware in
-        # Connection_Ripple(); these placeholders only show until then.
-        # NOTE: named stream_dropdown, not control_dropdown - the latter is the
+        # stream_dropdown, not control_dropdown - the latter is the
         # MVC gesture selector built in _mode_select().
         self.InputSignal_layout = QHBoxLayout()
         self.stream_label = QLabel("Input Stream:")
@@ -165,8 +164,6 @@ class RippleGUI(QMainWindow):
         self.main_layout.addWidget(self.right_widget)
 
         # Initializers
-        # Built at the placeholder rate; reinitialise_filters() re-designs them
-        # at the real stream rate the moment a stream is enabled.
         self.signal_processor = SignalProcessor(num_channels=self.num_channels,
                                                 fs=EMG_SAMPLE_RATE)
         self.ripplestream = None      # RippleController, made on connect
@@ -204,8 +201,7 @@ class RippleGUI(QMainWindow):
         self._latest_control_signal = None
         # Continuous per-channel proportional %MVC (0-100) for the bar game.
         self._latest_norm_pct = None
-        # Hold a reference to a running game so it isn't garbage-collected while
-        # its QTimer drives it inside our Qt event loop.
+
         self._active_game = None
         self._plot_timer = QTimer()
         self._plot_timer.setInterval(PLOT_TIMER_MS)  # ~30 fps
@@ -490,12 +486,6 @@ class RippleGUI(QMainWindow):
         self._refresh_calibration_state()
 
     def on_same_mvc_checkbox_changed(self, state):
-        """
-        Ticked: take the currently selected muscle's MVC and use it for every
-        muscle, so all channels normalize against that one trial.
-        Unticked: nothing is restored automatically - re-run the muscles you
-        want back on their own values.
-        """
         if state == Qt.Checked:
             current = self.current_gesture
             vals = self.option_mvc_values.get(current)
@@ -612,8 +602,6 @@ class RippleGUI(QMainWindow):
         self.jetpackgame_btn.setStyleSheet("background-color: black; color: white")
         self.left_layout.addWidget(self.jetpackgame_btn)
 
-
-            
     # log_status:
     def log_status(self, message: str):
         self.status_box.append(str(message))
@@ -685,13 +673,6 @@ class RippleGUI(QMainWindow):
         return True
 
     # Calibration (baseline)>>>
-    #
-    # Both captures are fixed-duration and stop themselves: a short settle
-    # period during which nothing is kept, then exactly BASELINE/MVC_DURATION_MS
-    # of collection. The elapsed clock is the sole authority for stopping -
-    # sample count is reported afterwards and only used to warn if the stream
-    # under-delivered, so a slow or stalled stream can never silently shorten
-    # or extend a capture.
     def _baseline_collect(self):
         if not self._ensure_streaming("Baseline"):
             return
@@ -743,10 +724,6 @@ class RippleGUI(QMainWindow):
         self._baseline_timer.stop()
 
         n_samples = len(self.ripplestream.calib_baseline)
-
-        # A calibration capture is self-contained: it started the stream, so it
-        # stops it too. Stop BEFORE processing so no further samples land in the
-        # log while the 3 s window is being analysed.
         self._stop_streaming()
         self.status_box.append("[Baseline] 3 s capture complete - streaming stopped.")
 
@@ -774,7 +751,6 @@ class RippleGUI(QMainWindow):
             self._maybe_enable_start()
 
     # Calibration (MVC)>>>
-
     def get_emg_data(self):
         if not self.post_processed_buffers:
             return None
@@ -922,24 +898,80 @@ class RippleGUI(QMainWindow):
         self.baseline_mean_data = np.zeros(n_ch)
         self.baseline_std_data  = np.zeros(n_ch)
 
+        # Filter the whole record, then drop the startup transient before taking
+        # statistics - the offline chain is primed from sample 0 and rings down
+        # from there, inflating both mean and std.
+        self._calib_skip = min(samples_for_ms(CALIB_DISCARD_MS, self.fs_active),
+                               max(len(data) // 4, 1))
+
         for ch in range(n_ch):
             raw            = data[:, ch + 2]
             filtered       = self.signal_processor.preprocess_filters_offline(raw, ch)
             preprocessed   = self.signal_processor.rectify_emg(filtered)
             smoothed       = self.signal_processor.moving_window_rms(preprocessed, window_size=self.win_rms)
             post_processed = self.signal_processor.postprocess_filter_offline(smoothed, ch)
+            post_processed = post_processed[self._calib_skip:]
             self.baseline_mean_data[ch] = np.mean(post_processed)
             self.baseline_std_data[ch]  = np.std(post_processed)
 
-        # mean_str = np.array2string(self.baseline_mean_data, separator=", ", max_line_width=np.inf)[1:-1]
-        # std_str  = np.array2string(self.baseline_std_data,  separator=", ", max_line_width=np.inf)[1:-1]
-        # self.Baseline_input.setText(f"mean = {mean_str}\nstd = {std_str}")
-        self.status_box.append(f"50 samp Baseline:{post_processed[:50]}")
-        self.status_box.append(f"Baseline Mean: {self.baseline_mean_data}")
-        self.status_box.append(f"Baseline Std:  {self.baseline_std_data}")
+        self.status_box.append(f"Baseline Mean: {np.round(self.baseline_mean_data, 3)}")
+        self.status_box.append(f"Baseline Std:  {np.round(self.baseline_std_data, 3)}")
         # This mean+std value is the actual resting threshold used for normalization.
         self.status_box.append(f"Baseline (mean+std) -> used for normalization: "
                                f"{np.round(self.baseline_mean_data + self.baseline_std_data, 4)}")
+
+        # A resting envelope this jittery makes peak-based MVC meaningless: the
+        # 3 s max of the noise alone lands 3-4 sigma up, whether or not anything
+        # was contracted.
+        cv = self.baseline_std_data / np.maximum(self.baseline_mean_data, 1e-9)
+        self.status_box.append(
+            "Baseline variability (std/mean): "
+            + ", ".join(f"{self.Channel_Names[i] if i < len(self.Channel_Names) else i}"
+                        f"={cv[i]:.0%}" for i in range(n_ch)))
+        noisy = [self.Channel_Names[i] for i in range(n_ch) if cv[i] > BASELINE_CV_WARN]
+        if noisy:
+            self.status_box.append(
+                f"[WARN] Resting signal is very unsteady on {noisy} "
+                f"(>{BASELINE_CV_WARN:.0%}). At this variability a 3 s peak of pure "
+                f"rest already reaches ~{np.round(self.baseline_mean_data + 3*self.baseline_std_data, 0)}, "
+                f"so an MVC near that value proves nothing. Check electrode contact, "
+                f"skin prep, and that the reference sits on quiet tissue.")
+
+    def _check_mvc_selectivity(self, gesture, action_mvc):
+        """
+        Contracting one muscle should move ITS channel and leave the others near
+        rest. Score every channel in units of its own baseline sigma: if an idle
+        channel rises as much as the target, the channels are not independent -
+        typically a shared reference sitting on active tissue, so both channels
+        are really measuring the reference.
+        """
+        target = self.muscle_channel(gesture)
+        if target is None or not np.any(self.baseline_std_data):
+            return
+
+        sigma = (action_mvc[:self.num_channels] - self.baseline_mean_data) / \
+            np.maximum(self.baseline_std_data, 1e-9)
+        detail = ", ".join(
+            f"{self.Channel_Names[i] if i < len(self.Channel_Names) else i}"
+            f"={sigma[i]:+.1f}sd" + (" <-target" if i == target else "")
+            for i in range(self.num_channels))
+        self.status_box.append(f"[MVC][{gesture}] rise above rest: {detail}")
+
+        others = [i for i in range(self.num_channels) if i != target]
+        if not others:
+            return
+        worst = max(others, key=lambda i: sigma[i])
+        if sigma[target] <= 0:
+            return
+        ratio = sigma[worst] / sigma[target]
+        if ratio >= 0.6:
+            self.status_box.append(
+                f"[WARN] '{gesture}' was not selective: idle channel "
+                f"{self.Channel_Names[worst]} rose {sigma[worst]:.1f}sd vs the target's "
+                f"{sigma[target]:.1f}sd ({ratio:.0%}). Both channels are tracking the "
+                f"same signal - with a shared reference on active tissue, reference "
+                f"pickup appears on EVERY channel. A bipolar pair per muscle, or a "
+                f"reference on a site away from both recording limbs, fixes this.")
 
     def mvc_calculation(self, mvc_array, gesture=None):
         gesture = gesture or self.current_gesture
@@ -947,12 +979,16 @@ class RippleGUI(QMainWindow):
         n_ch = mvc_array.shape[1] - 2
         action_mvc = np.zeros(n_ch)
 
+        skip = min(samples_for_ms(CALIB_DISCARD_MS, self.fs_active),
+                   max(len(mvc_array) // 4, 1))
+
         for ch in range(n_ch):
             raw            = mvc_array[:, ch + 2]
             filtered       = self.signal_processor.preprocess_filters_offline(raw, ch)
             rectified      = self.signal_processor.rectify_emg(filtered)
             smoothed       = self.signal_processor.moving_window_rms(rectified, window_size=self.win_rms)
             post_processed = self.signal_processor.postprocess_filter_offline(smoothed, ch)
+            post_processed = post_processed[skip:]
 
             if len(post_processed) > 0:
                 peaks, _ = find_peaks(post_processed, height=0)
@@ -960,6 +996,7 @@ class RippleGUI(QMainWindow):
                                 if len(peaks) > 0 else float(np.max(post_processed)))
 
         self.option_mvc_values[gesture] = action_mvc.tolist()
+        self._check_mvc_selectivity(gesture, action_mvc)
 
         # Ticked box: this trial becomes the MVC for every muscle.
         if getattr(self, "same_mvc_checkbox", None) is not None \
@@ -1384,7 +1421,7 @@ class RippleGUI(QMainWindow):
         else:
             # Uncalibrated: raw straight off the NIP, no filtering or scaling.
             snap, _ = self.ripplestream.snapshot_buffers()
-            buffers = [np.asarray(b, dtype=np.float64) for b in snap]
+            buffers = [np.asarray(b, dtype=np.float64) for b in self.post_processed_buffers]
 
         for i, line in enumerate(self.data_lines):
             if i >= len(buffers):
