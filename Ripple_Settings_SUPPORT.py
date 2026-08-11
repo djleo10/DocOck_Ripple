@@ -1,12 +1,87 @@
+import xipppy as xp
+
+# --- Ripple continuous streams -------------------------------------------
+# Canonical stream name -> (reader fn, nominal sample rate in Hz).
+# The canonical names are the strings xipppy's C API expects for
+# signal_set()/signal()/filter_set(). get_fe_streams() reports these same
+# names, so we normalize whatever it returns through STREAM_ALIASES below
+# before looking anything up here.
+STREAM_READERS = {
+    'raw':     (xp.cont_raw,    30000),   # 30 kHz broadband
+    'hires':   (xp.cont_hires,   2000),   # 2 kHz
+    'hifreq':  (xp.cont_hifreq,  7500),   # 7.5 kHz
+    'lfp':     (xp.cont_lfp,     1000),   # 1 kHz
+    'emg':     (xp.cont_emg,     2000),   # EMG stream
+}
+
+# The front end / older scripts spell some of these differently. Map every
+# spelling we've seen onto the canonical key used in STREAM_READERS.
+STREAM_ALIASES = {
+    'raw': 'raw',
+    'hires': 'hires',
+    'hi-res': 'hires',
+    'hi_res': 'hires',
+    'hifreq': 'hifreq',
+    'hi-freq': 'hifreq',
+    'hf': 'hifreq',
+    'lfp': 'lfp',
+    'emg': 'emg',
+}
+
+# Human-readable dropdown text. The QComboBox stores the canonical name as
+# the item's userData, so the GUI never has to parse this back.
+STREAM_LABELS = {
+    'raw':    'raw (30 kHz)',
+    'hires':  'hi-res (2 kHz)',
+    'hifreq': 'hifreq (7.5 kHz)',
+    'lfp':    'lfp (1 kHz)',
+    'emg':    'emg (2 kHz)',
+}
+
+# Order streams are offered in when several are available.
+STREAM_PREFERENCE = ['hires', 'emg', 'raw', 'hifreq', 'lfp']
+
+# The NIP clock runs at 30 kHz; every stream's sample period is an integer
+# number of these ticks (raw=1, hifreq=4, hires/emg=15, lfp=30).
+NIP_CLOCK_HZ = 30000
+
+
+def normalize_stream(name):
+    """Map a stream name from any source onto its canonical xipppy key."""
+    return STREAM_ALIASES.get(str(name).strip().lower())
+
+
+def stream_reader(name):
+    """Return (reader_fn, sample_rate_hz) for a stream name, or (None, None)."""
+    canon = normalize_stream(name)
+    if canon is None:
+        return None, None
+    return STREAM_READERS.get(canon, (None, None))
+
+
+def ticks_per_sample(fs):
+    """NIP clock ticks between consecutive samples of an fs Hz stream."""
+    return max(1, int(round(NIP_CLOCK_HZ / float(fs))))
+
+
+# --- acquisition ----------------------------------------------------------
+ACQ_POLL_MS      = 20     # worker sleeps this long between block reads
+DISPLAY_SECONDS  = 2.0    # rolling window kept per channel for plotting
+MAX_BUFFER_PTS   = 30000  # hard cap so 30 kHz raw doesn't eat memory
+ACQ_MAX_LAG_S    = 0.5    # if we fall this far behind, resync to newest data
+
+N_CHANNELS_TO_PRINT = 2      # how many electrodes to actually stream from
+
+# --- plot geometry --------------------------------------------------------
 GRAPH_W      = 1000
 GRAPH_H      = 100
 ROW_SPACING  = 2
-LABEL_W      = 50
+LABEL_W      = 90
 LEFT_MARGIN  = LABEL_W
 
-
-BUFFER_SIZE    = 2000       
-TIMER_MS       = 10           # 100 fps refresh
+BUFFER_SIZE    = 2000
+TIMER_MS       = 10           # legacy; kept for compatibility
+PLOT_TIMER_MS  = 33           # ~30 fps redraw
 EMG_SAMPLE_RATE  = 1000        # EMG Raw (1000 Hz)
 
 
@@ -22,22 +97,54 @@ WINDOW = 50
 # Window for segmenting (last 50 samples)
 WIN_SAMP = 300
 
+# Ripple streams at 2 k / 7.5 k / 30 kHz, so any window expressed in SAMPLES
+# means a different duration per stream. WINDOW=50 was 50 ms at MyoWare's
+# 1 kHz but only 1.7 ms at 30 kHz raw - a 30x error that wrecks the envelope.
+# Define the durations here and convert to samples at the live rate.
+WINDOW_MS   = 1000.0 * WINDOW   / EMG_SAMPLE_RATE   # 50 ms  RMS smoothing
+WIN_SAMP_MS = 1000.0 * WIN_SAMP / EMG_SAMPLE_RATE   # 300 ms control window
+
+
+def samples_for_ms(ms, fs):
+    """Convert a duration in ms to a sample count at fs Hz (minimum 1)."""
+    return max(1, int(round(ms * fs / 1000.0)))
+
+
 BASELINE_DURATION_MS = 3000
 MVC_DURATION_MS      = 3000
+# Dead time after arming a capture, before collection starts. Lets the stream
+# settle (and the subject reach effort) without that transient landing in the
+# calibration data. Not counted toward the 3 s.
+CALIB_SETTLE_MS      = 500
 
 MVC_SAMPLE_LIMIT = int(MVC_DURATION_MS * EMG_SAMPLE_RATE / 1000)
 BASELINE_SAMPLE_LIMIT = int(BASELINE_DURATION_MS * EMG_SAMPLE_RATE / 1000)
+
+# MVC is captured one muscle at a time. M<i> is the muscle on electrode <i>, so
+# M1's capture supplies channel 0's MVC, M2's supplies channel 1's, and so on -
+# you can't maximally contract every muscle at once, so each channel gets its
+# value from its own trial.
+MUSCLE_PREFIX = "M"
+
+
+def muscle_names(n_channels):
+    """['M1', 'M2', ...] - one entry per streamed channel."""
+    return [f"{MUSCLE_PREFIX}{i + 1}" for i in range(max(0, int(n_channels)))]
+
+# Y-axis once normalization is live (0-1 with headroom)
+NORM_Y_MIN = -0.2
+NORM_Y_MAX = 1.2
 
 # Data Plotting
 EMG_TYPES = {"EMG"}
 NUM_CHANNELS = 6
 CHANNEL_COLORS = [
-    "#00E5FF",  
-    "#376E00",  
-    "#FF4081",  
-    "#FFEA00",  
-    "#E040FB",  
-    "#FF6D00",  
-    "#1DE9B6",  
-    "#F50057",  
+    "#00E5FF",
+    "#376E00",
+    "#FF4081",
+    "#FFEA00",
+    "#E040FB",
+    "#FF6D00",
+    "#1DE9B6",
+    "#F50057",
 ]
