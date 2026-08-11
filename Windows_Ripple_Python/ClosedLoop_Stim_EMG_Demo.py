@@ -67,10 +67,12 @@ def verify_connections():
     Verifies that both EMG and stimulation front ends are connected.
     """
     stim_channels = xp.list_elec('stim')
+    print("Stim channels detected:", stim_channels)
     if not stim_channels:
         raise RuntimeError("ERROR - Stim FE not detected")
 
-    rec_channels = xp.list_elec('EMG')
+    rec_channels = xp.list_elec('macro')
+    print("EMG channels detected:", rec_channels)
     if not rec_channels:
         raise RuntimeError("ERROR - EMG FE not detected")
 
