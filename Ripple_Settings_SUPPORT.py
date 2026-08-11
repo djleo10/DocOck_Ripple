@@ -97,10 +97,7 @@ WINDOW = 50
 # Window for segmenting (last 50 samples)
 WIN_SAMP = 300
 
-# Ripple streams at 2 k / 7.5 k / 30 kHz, so any window expressed in SAMPLES
-# means a different duration per stream. WINDOW=50 was 50 ms at MyoWare's
-# 1 kHz but only 1.7 ms at 30 kHz raw - a 30x error that wrecks the envelope.
-# Define the durations here and convert to samples at the live rate.
+# Ripple streams at 2 k / 7.5 k / 30 kHz
 WINDOW_MS   = 1000.0 * WINDOW   / EMG_SAMPLE_RATE   # 50 ms  RMS smoothing
 WIN_SAMP_MS = 1000.0 * WIN_SAMP / EMG_SAMPLE_RATE   # 300 ms control window
 
@@ -116,6 +113,15 @@ MVC_DURATION_MS      = 3000
 # settle (and the subject reach effort) without that transient landing in the
 # calibration data. Not counted toward the 3 s.
 CALIB_SETTLE_MS      = 500
+# The offline filter chain is primed from each array's first sample, so the
+# envelope still rings for a while at the start. Measured at 7500 Hz on a
+# stationary input: discarding this much cuts the baseline std from 60.8 to
+# 26.5 (the rest of the record is unaffected). Dropped before mean/std/peak.
+CALIB_DISCARD_MS     = 100
+# A resting envelope this variable means contact/montage trouble: a 3 s peak of
+# a signal with this coefficient of variation lands 3-4 sigma up on its own,
+# which is indistinguishable from a real contraction.
+BASELINE_CV_WARN     = 0.25
 
 MVC_SAMPLE_LIMIT = int(MVC_DURATION_MS * EMG_SAMPLE_RATE / 1000)
 BASELINE_SAMPLE_LIMIT = int(BASELINE_DURATION_MS * EMG_SAMPLE_RATE / 1000)

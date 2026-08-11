@@ -8,9 +8,7 @@ from PyQt5.QtCore import QMutex, QThread, pyqtSignal
 class RippleController:
     """
     Talks to the Grapevine NIP through xipppy.
-
-    Unlike the MyoWare serial controller this replaces, xipppy hands back
-    *blocks* of samples rather than one packet per sample: cont_hires(n, elecs)
+    xipppy hands back *blocks* of samples rather than one packet per sample: cont_hires(n, elecs)
     returns n*len(elecs) floats laid out channel-major (all of elec[0]'s n
     samples, then all of elec[1]'s, ...). The acquisition loop below reads one
     block per poll and de-interleaves it into the per-channel deques.
@@ -24,6 +22,8 @@ class RippleController:
                                 else list(range(NUM_CHANNELS))
         self.elecs = []
         self.num_channels = len(self.active_channels)
+        # {elec: {canonical_stream: name_as_reported_by_get_fe_streams}}
+        self._native_by_elec = {}
 
         self.connected = False
         self.stream_name = None      # canonical stream currently enabled
@@ -34,9 +34,6 @@ class RippleController:
         self.calib_baseline = []  # baseline calibration log
         self.calib_mvc = []       # MVC calibration log
 
-        # Read live by the acquisition loop so the GUI can start/stop a
-        # calibration capture without restarting the stream. None -> the
-        # samples go to Entire_Signal.
         self.calib_mode = None
 
         self.buffers_emg = [
@@ -63,7 +60,6 @@ class RippleController:
         else:
             self.status_update(msg)
 
-    # --- connection -------------------------------------------------------
     def connect_to_processor(self):
         """
         Connects to the Neural Interface Processor. If UDP connection fails,
@@ -109,7 +105,6 @@ class RippleController:
             info["NIP clock"] = f"<unavailable> {e}"
         return info
 
-    # --- discovery --------------------------------------------------------
     def find_electrodes(self):
         self._emit("\n--- Front ends ---")
 
@@ -157,10 +152,6 @@ class RippleController:
         return streams_by_elec
 
     def select_channels(self, n_channels):
-        """
-        Take the first n_channels detected electrodes as CH 1..N and resize the
-        rolling buffers to match. Returns the electrode list actually selected.
-        """
         found = self.find_electrodes()
         self.elecs = list(found)[:n_channels]
         if not self.elecs:
@@ -177,23 +168,27 @@ class RippleController:
         return self.elecs
 
     def available_streams(self, elecs=None):
-        """
-        Canonical stream names supported by *every* selected electrode and
-        readable by us, ordered by STREAM_PREFERENCE. Discovering these rather
-        than hardcoding avoids the 'hi-res' vs 'hires' naming mismatch.
-        """
         elecs = self.elecs if elecs is None else list(elecs)
         if not elecs:
             return []
 
         streams_by_elec = self.report_streams(elecs)
         common = None
+        # signal_set() wants the stream string EXACTLY as get_fe_streams()
+        # reported it. Front ends differ: this one reports 'hi-res' while the
+        # reader is cont_hires, so sending the canonical 'hires' is rejected
+        # with a bare "Xipplib call failed". Keep the native spelling per
+        # electrode and use it for every signal_set/signal call.
+        self._native_by_elec = {}
         for elec in elecs:
             canon = set()
+            native = {}
             for raw_name in streams_by_elec.get(elec, []):
                 name = normalize_stream(raw_name)
                 if name in STREAM_READERS:
                     canon.add(name)
+                    native[name] = raw_name
+            self._native_by_elec[elec] = native
             common = canon if common is None else (common & canon)
 
         common = common or set()
@@ -216,15 +211,30 @@ class RippleController:
 
         on = []
         for elec in elecs:
-            try:
-                xp.signal_set(elec, canon, True)
-                sleep(0.005)
-                if xp.signal(elec, canon):
-                    on.append(elec)
-                else:
-                    self._emit(f"  elec {elec}: '{canon}' did not turn on")
-            except Exception as e:
-                self._emit(f"  elec {elec}: '{canon}' failed - {e}")
+            # Native spelling first (what the FE reported), canonical as a
+            # fallback for electrodes we never probed.
+            names = []
+            native = getattr(self, '_native_by_elec', {}).get(elec, {}).get(canon)
+            if native:
+                names.append(native)
+            if canon not in names:
+                names.append(canon)
+
+            turned_on = False
+            errors = []
+            for name in names:
+                try:
+                    xp.signal_set(elec, name, True)
+                    sleep(0.005)
+                    if xp.signal(elec, name):
+                        on.append(elec)
+                        turned_on = True
+                        break
+                    errors.append(f"'{name}' did not turn on")
+                except Exception as e:
+                    errors.append(f"'{name}' -> {e}")
+            if not turned_on:
+                self._emit(f"  elec {elec}: {'; '.join(errors)}")
 
         if not on:
             self._emit(f"[Stream] '{canon}' could not be enabled on any electrode.")
@@ -250,10 +260,12 @@ class RippleController:
         if canon is None:
             return
         for elec in elecs:
-            try:
-                xp.signal_set(elec, canon, False)
-            except Exception:
-                pass
+            native = getattr(self, '_native_by_elec', {}).get(elec, {}).get(canon)
+            for name in filter(None, (native, canon)):
+                try:
+                    xp.signal_set(elec, name, False)
+                except Exception:
+                    pass
 
     def _reset_buffers(self):
         self._buf_lock.lock()
@@ -298,9 +310,6 @@ class RippleController:
 
         tps = ticks_per_sample(fs)
 
-        # Passing a non-zero start_timestamp is what makes reads gapless AND
-        # what makes xipppy return a real timestamp - with start_timestamp=0 it
-        # returns the newest samples and a timestamp of 0.
         try:
             data, ts = reader(npoints, self.elecs, self._next_ts)
         except Exception as e:
@@ -450,35 +459,3 @@ class RippleController:
             pass
         self.connected = False
 
-
-class RippleThread(QThread):
-    """
-    Runs RippleController.acquire() off the GUI thread.
-
-    The controller instance is shared with the GUI, which only ever touches it
-    through snapshot_buffers() (mutex-protected), so no data is copied across
-    the thread boundary on every sample.
-    """
-    status_update = pyqtSignal(str)
-
-    def __init__(self, controller, parent=None):
-        super().__init__(parent)
-        self.ripple = controller
-        self._stop = False
-        self.calib_mode = None
-
-    def stop_requested(self):
-        return self._stop
-
-    def run(self):
-        self._stop = False
-        try:
-            self.ripple.acquire(stop_flag=self.stop_requested,
-                                calib_mode=self.calib_mode)
-        except Exception as e:
-            self.status_update.emit(f"[Stream] acquisition stopped: {e}")
-
-    def stop(self, timeout_ms=2000):
-        self._stop = True
-        if self.isRunning():
-            self.wait(timeout_ms)

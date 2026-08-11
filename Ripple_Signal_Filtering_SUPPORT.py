@@ -1,4 +1,5 @@
-from scipy.signal import butter, lfilter, lfilter_zi, iirnotch
+from scipy.signal import (butter, lfilter, lfilter_zi, iirnotch,
+                          sosfilt, sosfilt_zi, tf2sos)
 import numpy as np
 from Ripple_Settings_SUPPORT import *
 
@@ -13,23 +14,43 @@ class SignalProcessor:
         self.highcut_lpf = highcut
         self.bpf_order = order
 
-        # Design filters
+        # Design filters.
+        #
+        # Everything runs as second-order sections (SOS) rather than a single
+        # (b, a) polynomial. These cutoffs are very low relative to the Ripple
+        # sample rates - a 6 Hz lowpass at 30 kHz is Wn = 4e-4 - and expanding
+        # such a filter into one high-order polynomial loses precision fast.
+        # Measured pole displacement from the designed poles:
+        #     1 kHz  2.2e-11      7.5 kHz  9.6e-09      30 kHz  1.1e-06
+        # SOS keeps each conjugate pair in its own biquad, so no expansion
+        # happens and the realized filter matches the design at every rate.
+        # The (b, a) forms are kept alongside for inspection only.
         self.b_high, self.a_high = self._design_highpass_filter()
         self.b_low, self.a_low = self._design_lowpass_filter()
         self.b_notch, self.a_notch = self._design_notch_filter()
+
+        self.sos_high  = butter(self.highpass_order,
+                                self.highpass_cutoff / (0.5 * self.fs),
+                                btype='high', output='sos')
+        self.sos_low   = butter(self.bpf_order,
+                                self.highcut_lpf / (0.5 * self.fs),
+                                btype='low', output='sos')
+        # iirnotch only returns (b, a); it is 2nd order, so this is one section.
+        self.sos_notch = tf2sos(self.b_notch, self.a_notch)
 
         self._init_filter_states()
 
     def _init_filter_states(self):
         n = self.num_channels
-        # Unit-step steady-state templates. lfilter_zi assumes an input amplitude
-        # of 1.0, so these must be scaled by the FIRST sample of each stage's
-        # input before use (done lazily on the first filter call per channel).
-        # Otherwise the filter "rings down" from 1.0 and injects a large startup
-        # transient that contaminates the signal (and calibration).
-        self._ziu_high  = lfilter_zi(self.b_high,  self.a_high)
-        self._ziu_low   = lfilter_zi(self.b_low,   self.a_low)
-        self._ziu_notch = lfilter_zi(self.b_notch, self.a_notch)
+        # Unit-step steady-state templates. sosfilt_zi assumes an input
+        # amplitude of 1.0, so these must be scaled by the FIRST sample of each
+        # stage's input before use (done lazily on the first filter call per
+        # channel). Otherwise the filter "rings down" from 1.0 and injects a
+        # large startup transient that contaminates the signal (and
+        # calibration). Shape is (n_sections, 2) instead of lfilter's (order,).
+        self._ziu_high  = sosfilt_zi(self.sos_high)
+        self._ziu_low   = sosfilt_zi(self.sos_low)
+        self._ziu_notch = sosfilt_zi(self.sos_notch)
 
         # None == "not primed yet"; the first sample seen primes the state.
         self.zi_high  = [None] * n
@@ -75,20 +96,24 @@ class SignalProcessor:
     def preprocess_filters(self, data, channel):
         """Real-time causal filtering — updates zi state for this channel."""
         data = np.array(data, dtype=float)
+        if data.size == 0:
+            return data
         # Prime each stage from the first sample of ITS OWN input the first time.
         if self.zi_high[channel] is None:
             self.zi_high[channel] = self._ziu_high * data[0]
-        data, self.zi_high[channel] = lfilter(self.b_high, self.a_high, data, zi=self.zi_high[channel])
+        data, self.zi_high[channel] = sosfilt(self.sos_high, data, zi=self.zi_high[channel])
         if self.zi_notch[channel] is None:
             self.zi_notch[channel] = self._ziu_notch * data[0]  # data is now the HPF output
-        data, self.zi_notch[channel] = lfilter(self.b_notch, self.a_notch, data, zi=self.zi_notch[channel])
+        data, self.zi_notch[channel] = sosfilt(self.sos_notch, data, zi=self.zi_notch[channel])
         return data
 
     def postprocess_filter(self, data, channel):
         data = np.array(data, dtype=float)
+        if data.size == 0:
+            return data
         if self.zi_low[channel] is None:
             self.zi_low[channel] = self._ziu_low * data[0]
-        data, self.zi_low[channel]  = lfilter(self.b_low,  self.a_low,  data, zi=self.zi_low[channel])
+        data, self.zi_low[channel]  = sosfilt(self.sos_low, data, zi=self.zi_low[channel])
         return data
 
     def reset_filter_states(self):
@@ -104,26 +129,37 @@ class SignalProcessor:
         self.b_high,  self.a_high  = self._design_highpass_filter()
         self.b_low,   self.a_low   = self._design_lowpass_filter()
         self.b_notch, self.a_notch = self._design_notch_filter()
+        self.sos_high  = butter(self.highpass_order,
+                                self.highpass_cutoff / (0.5 * self.fs),
+                                btype='high', output='sos')
+        self.sos_low   = butter(self.bpf_order,
+                                self.highcut_lpf / (0.5 * self.fs),
+                                btype='low', output='sos')
+        self.sos_notch = tf2sos(self.b_notch, self.a_notch)
         self._init_filter_states()
         # print(f"[SignalProcessor] Filters reinitialised at fs={self.fs} Hz")
 
     def preprocess_filters_offline(self, data, channel):
         """
-        Same causal lfilter as real-time but with fresh zi state.
+        Same causal filtering as real-time but with fresh zi state.
         Use for calibration processing so streaming state doesn't contaminate.
         """
         data = np.array(data, dtype=float)
-        zi_high  = lfilter_zi(self.b_high,  self.a_high) * data[0]
-        data, _ = lfilter(self.b_high,  self.a_high,  data, zi=zi_high)
-        zi_notch = lfilter_zi(self.b_notch, self.a_notch) * data[0]  # data is now HPF output
-        data, _ = lfilter(self.b_notch, self.a_notch, data, zi=zi_notch)
+        if data.size == 0:
+            return data
+        zi_high  = self._ziu_high * data[0]
+        data, _ = sosfilt(self.sos_high, data, zi=zi_high)
+        zi_notch = self._ziu_notch * data[0]  # data is now HPF output
+        data, _ = sosfilt(self.sos_notch, data, zi=zi_notch)
         return data
 
     def postprocess_filter_offline(self, data, channel):
         """Same as postprocess_filter but with fresh zi state."""
         data = np.array(data, dtype=float)
-        zi_low = lfilter_zi(self.b_low, self.a_low) * data[0]
-        data, _ = lfilter(self.b_low, self.a_low, data, zi=zi_low)
+        if data.size == 0:
+            return data
+        zi_low = self._ziu_low * data[0]
+        data, _ = sosfilt(self.sos_low, data, zi=zi_low)
         return data
 
     # Proportional control inference function
