@@ -1,0 +1,15 @@
+{
+  "game": "jetpack_joyride",
+  "timestamp": "2026-08-11T14:51:32.410809",
+  "num_channels": 1,
+  "high_scores": {
+    "first": 415,
+    "second": 316,
+    "third": 316
+  },
+  "money": 1751,
+  "last_run": {
+    "distance": 97.0,
+    "score": 0
+  }
+}

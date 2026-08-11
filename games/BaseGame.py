@@ -9,9 +9,9 @@ from datetime import datetime
 from PyQt5.QtCore import QTimer
 
 try:
-    from ..MyoWare_USBFinder_SUPPORT import Myoware_USBFinder
+    from ..Ripple_USB_Finder_SUPPORT import Ripple_USBFinder
 except ImportError:
-    from MyoWare_USBFinder_SUPPORT import Myoware_USBFinder
+    from Ripple_USB_Finder_SUPPORT import Ripple_USBFinder
 
 class BaseGame(ABC):
     def __init__(self, basepath=None, num_channels=2, save_root=None,
@@ -248,7 +248,7 @@ class BaseGame(ABC):
             folder = os.path.join(self._save_root, date_str)
         else:
             # ← standalone / fallback: detect USB ourselves
-            finder   = Myoware_USBFinder(None)
+            finder   = Ripple_USBFinder(None)
             usb_root = finder.find_usb_drive()
             if usb_root:
                 folder = os.path.join(usb_root, "Data", date_str)
