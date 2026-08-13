@@ -15,7 +15,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, QPoint, pyqtSignal, QElapsedTimer
 from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QPixmap, QPolygon,  QStandardItem, QStandardItemModel, QDoubleValidator
-from PyQt5.QtWidgets import QCheckBox, QGridLayout,QGraphicsProxyWidget, QGraphicsScene, QGraphicsView, QLineEdit, QMessageBox, QInputDialog, QComboBox, QTextEdit, QListWidget, QAbstractItemView, QDialog
+from PyQt5.QtWidgets import QCheckBox, QGridLayout,QGraphicsProxyWidget, QGraphicsScene, QGraphicsView, QLineEdit, QMessageBox, QInputDialog, QComboBox, QTextEdit, QListWidget, QAbstractItemView, QDialog, QStackedWidget, QSpinBox, QDoubleSpinBox, QFormLayout
 import pyqtgraph as pqtg
 
 import collections as c
@@ -26,6 +26,7 @@ from Ripple_USB_Finder_SUPPORT import Ripple_USBFinder
 from Ripple_Signal_Acquisition import RippleController
 from Ripple_Signal_Thread_SUPPORT import RippleThread
 from Ripple_Signal_Filtering_SUPPORT import SignalProcessor
+from Ripple_Stim_SUPPORT import StimParams, RippleStimulator, StimParamError
 from Ripple_Settings_SUPPORT  import *
 
 
@@ -124,6 +125,21 @@ class RippleGUI(QMainWindow):
         self.mode_panel_layout = QVBoxLayout()
         self.left_layout.addLayout(self.mode_panel_layout)
 
+        # One container per mode so switching is a single show/hide instead of
+        # tracking individual widgets.
+        self.recording_panel = QWidget()
+        self.recording_panel_layout = QVBoxLayout(self.recording_panel)
+        self.recording_panel_layout.setContentsMargins(0, 0, 0, 0)
+        self.recording_panel.setVisible(False)
+
+        self.stim_panel = QWidget()
+        self.stim_panel_layout = QVBoxLayout(self.stim_panel)
+        self.stim_panel_layout.setContentsMargins(0, 0, 0, 0)
+        self.stim_panel.setVisible(False)
+
+        self.mode_panel_layout.addWidget(self.recording_panel)
+        self.mode_panel_layout.addWidget(self.stim_panel)
+
         self.status_display()
         self.game_button_display()
 
@@ -154,11 +170,13 @@ class RippleGUI(QMainWindow):
         self.right_widget.setStyleSheet("background-color: black; color: white")
         self.right_layout = QVBoxLayout(self.right_widget)
 
-        self.EMG_IMU_Layout = QVBoxLayout()
-
-        # EMG display
-        self.EMG_IMU_Layout.addWidget(self.EMG_Plotting_layout(y_min_range = -2000, y_max_range = 4000), alignment=Qt.AlignCenter)
-        self.right_layout.addLayout(self.EMG_IMU_Layout)
+        # Recording and stimulation get their own plot pages; _mode_select
+        # flips between them.
+        self.view_stack = QStackedWidget()
+        self.view_stack.addWidget(self.EMG_Plotting_layout(y_min_range=-2000,
+                                                           y_max_range=4000))
+        self.view_stack.addWidget(self.Stim_Plotting_layout())
+        self.right_layout.addWidget(self.view_stack)
         
         self.main_layout.addWidget(self.left_widget)
         self.main_layout.addWidget(self.right_widget)
@@ -168,6 +186,7 @@ class RippleGUI(QMainWindow):
                                                 fs=EMG_SAMPLE_RATE)
         self.ripplestream = None      # RippleController, made on connect
         self.stream        = None      # RippleThread, made on connect
+        self.stimulator = RippleStimulator(status_update=self.status_signal)
         self.emg_control = False
 
         # Window sizes in SAMPLES at the live rate. Recomputed per stream.
@@ -208,6 +227,7 @@ class RippleGUI(QMainWindow):
         self._plot_timer.timeout.connect(self._update_plots)
         self._plot_timer.timeout.connect(self.rt_buffer_processing)
         self._recording_ui_built = False
+        self._stim_ui_built = False
 
         # State
         self.pairing         = False
@@ -274,6 +294,10 @@ class RippleGUI(QMainWindow):
         self.stream = RippleThread(self.ripplestream)
         self.stream.status_update.connect(self.log_status)
 
+        # Stim front end is discovered separately - it is usually a different FE
+        # from the recording one, and list_elec('stim') is the authority.
+        self._refresh_stim_hardware()
+
         self.establish_connection_btn.setStyleSheet("background-color: green; color: black")
 
     # Recording/Stimulation Mode:
@@ -281,11 +305,26 @@ class RippleGUI(QMainWindow):
         sender = self.sender()
 
         if sender == self.Stimulation_btn:
+            if self.running:
+                self.log_status("[Stim] Stop the recording stream before "
+                                "switching to stimulation.")
+                return
             self.Stimulation_btn.setStyleSheet("background-color: green; color: black")
             self.Recording_btn.setStyleSheet("background-color: black; color: white")
             self.Reg_data_Label.setText("STIMULATION")
             self.Reg_data_Label.setStyleSheet("font-size: 18px; font-weight: bold; color: black")
             self.Reg_data_Label.setAlignment(Qt.AlignCenter)
+
+            # Recording controls make no sense while stimulating, and vice versa.
+            self.recording_panel.setVisible(False)
+            self.stim_panel.setVisible(True)
+            self.view_stack.setCurrentIndex(1)
+
+            if not self._stim_ui_built:
+                self._build_stim_panel()
+                self._stim_ui_built = True
+                self._refresh_stim_hardware()
+            self._update_stim_preview()
 
         elif sender == self.Recording_btn:
             self.Recording_btn.setStyleSheet("background-color: green; color: black")
@@ -293,6 +332,13 @@ class RippleGUI(QMainWindow):
             self.Reg_data_Label.setText("RECORDING")
             self.Reg_data_Label.setStyleSheet("font-size: 18px; font-weight: bold; color: black")
             self.Reg_data_Label.setAlignment(Qt.AlignCenter)
+
+            # Never leave stim armed when leaving stimulation mode.
+            if self._stim_ui_built:
+                self._stim_disarm("switched to recording")
+            self.stim_panel.setVisible(False)
+            self.recording_panel.setVisible(True)
+            self.view_stack.setCurrentIndex(0)
 
             # Build the recording controls once - re-clicking the button used to
             # stack a fresh copy of every widget into left_layout.
@@ -321,17 +367,17 @@ class RippleGUI(QMainWindow):
             self.gesture_layout.addWidget(self.gesture_label)
             self.gesture_layout.addWidget(self.control_dropdown)
             self.gesture_layout.addWidget(self.add_option_button)
-            self.mode_panel_layout.addLayout(self.gesture_layout)
+            self.recording_panel_layout.addLayout(self.gesture_layout)
 
             self.same_mvc_checkbox = QCheckBox(
                 "Use the selected muscle's MVC for all muscles")
             self.same_mvc_checkbox.setStyleSheet("color: black")
             self.same_mvc_checkbox.stateChanged.connect(self.on_same_mvc_checkbox_changed)
-            self.mode_panel_layout.addWidget(self.same_mvc_checkbox)
+            self.recording_panel_layout.addWidget(self.same_mvc_checkbox)
 
             self.mvc_display = QLabel(f"MVC [{self.current_gesture}]:\nnot calibrated")
             self.mvc_display.setStyleSheet("color: black")
-            self.mode_panel_layout.addWidget(self.mvc_display)
+            self.recording_panel_layout.addWidget(self.mvc_display)
 
             self.calib_layout = QHBoxLayout()
             self.baseline_btn = QPushButton("BASELINE")
@@ -344,7 +390,7 @@ class RippleGUI(QMainWindow):
 
             self.calib_layout.addWidget(self.baseline_btn)
             self.calib_layout.addWidget(self.MVC_btn)
-            self.mode_panel_layout.addLayout(self.calib_layout)
+            self.recording_panel_layout.addLayout(self.calib_layout)
 
             self.button_layout = QHBoxLayout()
             self.start_btn = QPushButton("Start Stream")
@@ -357,13 +403,13 @@ class RippleGUI(QMainWindow):
             self.stop_btn.setStyleSheet("background-color: black; color: white")
             self.button_layout.addWidget(self.stop_btn)
 
-            self.mode_panel_layout.addLayout(self.button_layout)
+            self.recording_panel_layout.addLayout(self.button_layout)
     
             self.Goodtogo_label = QLabel("Ready to use the device !!!")
             self.Goodtogo_label.setStyleSheet("font-size: 14px; font-weight: bold; color: Green")
             self.Goodtogo_label.setAlignment(Qt.AlignCenter)
             self.Goodtogo_label.setVisible(False)
-            self.mode_panel_layout.addWidget(self.Goodtogo_label)
+            self.recording_panel_layout.addWidget(self.Goodtogo_label)
     
             self.save_layout = QHBoxLayout()
             self.save_emg_btn = QPushButton("SAVE EMG")
@@ -371,7 +417,7 @@ class RippleGUI(QMainWindow):
             self.save_emg_btn.setStyleSheet("background-color: black; color: white")
             self.save_layout.addWidget(self.save_emg_btn)
     
-            self.mode_panel_layout.addLayout(self.save_layout)
+            self.recording_panel_layout.addLayout(self.save_layout)
 
     # Muscles / MVC options >>>
     def muscle_channel(self, name):
@@ -457,7 +503,13 @@ class RippleGUI(QMainWindow):
 
     # Add widgets and options>>>
     def add_new_option(self):
-        text, ok = QInputDialog.getText(self, "Add New Option", "Enter new option:")
+        # Built explicitly rather than via QInputDialog.getText so it can be
+        # styled - the static helper inherits the window's black background.
+        dialog = self._style_dialog(QInputDialog(self))
+        dialog.setWindowTitle("Add New Option")
+        dialog.setLabelText("Enter new option:")
+        ok = dialog.exec_()
+        text = dialog.textValue()
         if ok and text.strip():
             option_name = text.strip()
             if self.control_dropdown.findText(option_name) == -1:
@@ -602,6 +654,14 @@ class RippleGUI(QMainWindow):
         self.jetpackgame_btn.setStyleSheet("background-color: black; color: white")
         self.left_layout.addWidget(self.jetpackgame_btn)
 
+    def _style_dialog(self, dialog):
+        """
+        Dialogs inherit the main window's black background, so they must set
+        their own colours or they render black-on-black. One place for it.
+        """
+        dialog.setStyleSheet(DIALOG_STYLE)
+        return dialog
+
     # log_status:
     def log_status(self, message: str):
         self.status_box.append(str(message))
@@ -659,6 +719,376 @@ class RippleGUI(QMainWindow):
             self.channel_labels.append(lbl)
 
         return self.emg_view
+
+    # Stim display >>>
+    def Stim_Plotting_layout(self):
+        """
+        Two panes: one biphasic pulse in detail on top, the whole train below.
+        Both are rendered from the segments that would actually be sent.
+        """
+        page = QWidget()
+        lay = QVBoxLayout(page)
+
+        self.stim_pulse_plot = pqtg.PlotWidget()
+        self.stim_pulse_plot.setBackground('k')
+        self.stim_pulse_plot.setLabel('left', 'Current', units='uA')
+        self.stim_pulse_plot.setLabel('bottom', 'Time', units='ms')
+        self.stim_pulse_plot.setTitle('Single pulse', color='w')
+        self.stim_pulse_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.stim_pulse_plot.addLine(y=0, pen=pqtg.mkPen('#666', width=1))
+        self.stim_pulse_cath = self.stim_pulse_plot.plot(
+            pen=pqtg.mkPen('#00E5FF', width=2), name='cathode-leading')
+        self.stim_pulse_anod = self.stim_pulse_plot.plot(
+            pen=pqtg.mkPen('#FF6D00', width=2, style=Qt.DashLine))
+
+        self.stim_train_plot = pqtg.PlotWidget()
+        self.stim_train_plot.setBackground('k')
+        self.stim_train_plot.setLabel('left', 'Current', units='uA')
+        self.stim_train_plot.setLabel('bottom', 'Time', units='ms')
+        self.stim_train_plot.setTitle('Pulse train', color='w')
+        self.stim_train_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.stim_train_plot.addLine(y=0, pen=pqtg.mkPen('#666', width=1))
+        self.stim_train_cath = self.stim_train_plot.plot(
+            pen=pqtg.mkPen('#00E5FF', width=1))
+        self.stim_train_anod = self.stim_train_plot.plot(
+            pen=pqtg.mkPen('#FF6D00', width=1, style=Qt.DashLine))
+
+        self.stim_readout = QLabel("No stimulation parameters yet.")
+        self.stim_readout.setStyleSheet(
+            "color: white; background-color: #1e1e1e; padding: 6px;")
+        self.stim_readout.setWordWrap(True)
+
+        lay.addWidget(self.stim_pulse_plot, stretch=2)
+        lay.addWidget(self.stim_train_plot, stretch=3)
+        lay.addWidget(self.stim_readout)
+        return page
+
+    def _stim_spin(self, lo, hi, val, step=1, decimals=None, suffix=""):
+        box = QDoubleSpinBox() if decimals is not None else QSpinBox()
+        if decimals is not None:
+            box.setDecimals(decimals)
+        box.setRange(lo, hi)
+        box.setSingleStep(step)
+        box.setValue(val)
+        if suffix:
+            box.setSuffix(suffix)
+        box.setStyleSheet("background-color: black; color: white;")
+        box.valueChanged.connect(self._update_stim_preview)
+        return box
+
+    def _build_stim_panel(self):
+        """Every parameter that defines a biphasic bipolar train."""
+        d = STIM_DEFAULTS
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignRight)
+
+        def lbl(text):
+            q = QLabel(text)
+            q.setStyleSheet("color: black;")
+            return q
+
+        # --- electrode pair ---
+        self.stim_cathode_spin = self._stim_spin(0, 511, d['cathode_elec'])
+        self.stim_anode_spin   = self._stim_spin(0, 511, d['anode_elec'])
+        pair = QHBoxLayout()
+        pair.addWidget(self.stim_cathode_spin)
+        pair.addWidget(lbl("(-)  <->  (+)"))
+        pair.addWidget(self.stim_anode_spin)
+        form.addRow(lbl("Bipolar pair:"), pair)
+
+        # --- resolution: uA per amplitude step ---
+        self.stim_res_dropdown = QComboBox()
+        self.stim_res_dropdown.setStyleSheet("background-color: black; color: white")
+        for i, ua in enumerate(STIM_FALLBACK_RES_UA):
+            self.stim_res_dropdown.addItem(f"{i}: {ua:g} uA/step", ua)
+        self.stim_res_dropdown.setCurrentIndex(min(d['res_index'],
+                                                   self.stim_res_dropdown.count() - 1))
+        self.stim_res_dropdown.currentIndexChanged.connect(self._update_stim_preview)
+        form.addRow(lbl("Resolution:"), self.stim_res_dropdown)
+
+        # --- amplitude ---
+        self.stim_amp_spin = self._stim_spin(0, STIM_MAX_AMP_STEPS, d['amp_steps'])
+        form.addRow(lbl("Amplitude (steps):"), self.stim_amp_spin)
+
+        # --- phase timing, entered in microseconds ---
+        max_us = STIM_MAX_SEG_CLOCKS * STIM_CLOCK_US
+        self.stim_phase_spin = self._stim_spin(
+            STIM_CLOCK_US, max_us, d['phase_clocks'] * STIM_CLOCK_US,
+            step=STIM_CLOCK_US, decimals=1, suffix=" us")
+        form.addRow(lbl("Phase width:"), self.stim_phase_spin)
+
+        self.stim_ipi_spin = self._stim_spin(
+            0.0, max_us, d['interphase_clocks'] * STIM_CLOCK_US,
+            step=STIM_CLOCK_US, decimals=1, suffix=" us")
+        form.addRow(lbl("Interphase gap:"), self.stim_ipi_spin)
+
+        # --- second phase: mirror by default ---
+        self.stim_mirror_check = QCheckBox("Second phase mirrors the first "
+                                           "(charge balanced)")
+        self.stim_mirror_check.setChecked(True)
+        self.stim_mirror_check.setStyleSheet("color: black")
+        self.stim_mirror_check.stateChanged.connect(self._on_stim_mirror_changed)
+        form.addRow(self.stim_mirror_check)
+
+        self.stim_anod_phase_spin = self._stim_spin(
+            STIM_CLOCK_US, max_us, d['phase_clocks'] * STIM_CLOCK_US,
+            step=STIM_CLOCK_US, decimals=1, suffix=" us")
+        self.stim_anod_amp_spin = self._stim_spin(0, STIM_MAX_AMP_STEPS, d['amp_steps'])
+        self.stim_anod_phase_spin.setEnabled(False)
+        self.stim_anod_amp_spin.setEnabled(False)
+        form.addRow(lbl("2nd phase width:"), self.stim_anod_phase_spin)
+        form.addRow(lbl("2nd phase amp:"), self.stim_anod_amp_spin)
+
+        self.stim_cathfirst_check = QCheckBox("Cathodic phase first")
+        self.stim_cathfirst_check.setChecked(True)
+        self.stim_cathfirst_check.setStyleSheet("color: black")
+        self.stim_cathfirst_check.stateChanged.connect(self._update_stim_preview)
+        form.addRow(self.stim_cathfirst_check)
+
+        # --- train ---
+        self.stim_freq_spin = self._stim_spin(
+            NIP_CLOCK_HZ / STIM_MAX_PERIOD_CLOCKS, 10000.0, d['frequency_hz'],
+            step=1.0, decimals=3, suffix=" Hz")
+        form.addRow(lbl("Frequency:"), self.stim_freq_spin)
+
+        self.stim_npulses_spin = self._stim_spin(1, STIM_MAX_REPEATS, d['n_pulses'])
+        form.addRow(lbl("Number of pulses:"), self.stim_npulses_spin)
+
+        # --- optional amplitude ramp ---
+        self.stim_ramp_check = QCheckBox("Ramp amplitude across the train")
+        self.stim_ramp_check.setStyleSheet("color: black")
+        self.stim_ramp_check.stateChanged.connect(self._on_stim_ramp_changed)
+        form.addRow(self.stim_ramp_check)
+
+        self.stim_ramp_end_spin = self._stim_spin(0, STIM_MAX_AMP_STEPS, 115)
+        self.stim_ramp_end_spin.setEnabled(False)
+        form.addRow(lbl("Ramp to (steps):"), self.stim_ramp_end_spin)
+
+        self.stim_panel_layout.addLayout(form)
+
+        # --- arm / send / stop ---
+        self.stim_arm_btn = QPushButton("ARM STIM")
+        self.stim_arm_btn.setCheckable(True)
+        self.stim_arm_btn.setStyleSheet("background-color: black; color: white")
+        self.stim_arm_btn.clicked.connect(self._stim_arm_toggled)
+
+        self.stim_send_btn = QPushButton("SEND TRAIN")
+        self.stim_send_btn.setEnabled(False)
+        self.stim_send_btn.setStyleSheet("background-color: grey; color: black")
+        self.stim_send_btn.clicked.connect(self._stim_send)
+
+        self.stim_stop_btn = QPushButton("STOP STIM")
+        self.stim_stop_btn.setStyleSheet(
+            "background-color: #B00020; color: white; font-weight: bold")
+        self.stim_stop_btn.clicked.connect(self._stim_stop)
+
+        row = QHBoxLayout()
+        row.addWidget(self.stim_arm_btn)
+        row.addWidget(self.stim_send_btn)
+        row.addWidget(self.stim_stop_btn)
+        self.stim_panel_layout.addLayout(row)
+
+        self.stim_status_label = QLabel("Stim disarmed.")
+        self.stim_status_label.setStyleSheet("color: black; font-weight: bold")
+        self.stim_status_label.setAlignment(Qt.AlignCenter)
+        self.stim_panel_layout.addWidget(self.stim_status_label)
+
+    def _on_stim_mirror_changed(self, state):
+        mirrored = (state == Qt.Checked)
+        self.stim_anod_phase_spin.setEnabled(not mirrored)
+        self.stim_anod_amp_spin.setEnabled(not mirrored)
+        self._update_stim_preview()
+
+    def _on_stim_ramp_changed(self, state):
+        self.stim_ramp_end_spin.setEnabled(state == Qt.Checked)
+        self._update_stim_preview()
+
+    def _stim_params(self):
+        """Read the panel into a StimParams (times converted us -> clocks)."""
+        mirrored = self.stim_mirror_check.isChecked()
+        ramping = self.stim_ramp_check.isChecked()
+        return StimParams(
+            cathode_elec=self.stim_cathode_spin.value(),
+            anode_elec=self.stim_anode_spin.value(),
+            res_index=self.stim_res_dropdown.currentIndex(),
+            ua_per_step=float(self.stim_res_dropdown.currentData() or 1.0),
+            amp_steps=self.stim_amp_spin.value(),
+            phase_clocks=max(1, int(round(self.stim_phase_spin.value() / STIM_CLOCK_US))),
+            interphase_clocks=int(round(self.stim_ipi_spin.value() / STIM_CLOCK_US)),
+            anodic_phase_clocks=(None if mirrored else
+                                 max(1, int(round(self.stim_anod_phase_spin.value()
+                                                  / STIM_CLOCK_US)))),
+            anodic_amp_steps=(None if mirrored else self.stim_anod_amp_spin.value()),
+            cathodic_first=self.stim_cathfirst_check.isChecked(),
+            frequency_hz=self.stim_freq_spin.value(),
+            n_pulses=self.stim_npulses_spin.value(),
+            ramp_enabled=ramping,
+            ramp_end_steps=self.stim_ramp_end_spin.value() if ramping else None,
+        )
+
+    def _update_stim_preview(self, *_):
+        """Redraw both panes and the readout from the current parameters."""
+        if not getattr(self, "_stim_ui_built", False):
+            return
+        params = self._stim_params()
+        errs = params.validate()
+
+        if errs:
+            self.stim_readout.setText("CANNOT SEND:\n- " + "\n- ".join(errs))
+            self.stim_readout.setStyleSheet(
+                "color: #FF8A80; background-color: #1e1e1e; padding: 6px;")
+            for line in (self.stim_pulse_cath, self.stim_pulse_anod,
+                         self.stim_train_cath, self.stim_train_anod):
+                line.setData([], [])
+            self._stim_disarm("parameters invalid")
+            return
+
+        tp, yp = self.stimulator.render_single_pulse(params, 'cathode')
+        _, ypa = self.stimulator.render_single_pulse(params, 'anode')
+        self.stim_pulse_cath.setData(tp, yp)
+        self.stim_pulse_anod.setData(tp, ypa)
+
+        tt, yt = self.stimulator.render_waveform(params, 'cathode')
+        _, yta = self.stimulator.render_waveform(params, 'anode')
+        self.stim_train_cath.setData(tt, yt)
+        self.stim_train_anod.setData(tt, yta)
+
+        warns = params.warnings()
+        text = (
+            f"{params.summary()}\n"
+            f"pulse {params.pulse_us:.0f} us  |  period "
+            f"{params.period_clocks} clocks ({1000/max(params.actual_frequency_hz,1e-9):.1f} ms)"
+            f"  |  charge C {params.cathodic_charge_nc:.1f} nC / A "
+            f"{params.anodic_charge_nc:.1f} nC (net {params.charge_imbalance_nc:+.1f})\n"
+            f"timing: {'explicit per-pulse segments' if params.uses_explicit_segments else 'hardware period/repeats'}"
+        )
+        if warns:
+            text += "\n\nWARNING:\n- " + "\n- ".join(warns)
+        self.stim_readout.setText(text)
+        self.stim_readout.setStyleSheet(
+            ("color: #FFD180; " if warns else "color: white; ")
+            + "background-color: #1e1e1e; padding: 6px;")
+
+    def _stim_confirm_dialog(self, params, warns):
+        """
+        The pre-arm review box. Built separately from _stim_arm_toggled so its
+        appearance can be inspected without executing a modal loop.
+        """
+        bullets = "".join(f"<li style='margin-bottom:8px;'>{w}</li>" for w in warns)
+        body = (
+            f"<div style='color:#FFD180; font-size:14px;'>"
+            f"<b>Review before arming</b></div>"
+            f"<ul style='color:#FFD180; margin-left:-18px;'>{bullets}</ul>"
+            f"<div style='color:#FFFFFF;'><b>Parameters</b><br>"
+            f"<span style='font-family:Consolas,monospace;'>"
+            f"{params.summary().replace(' | ', '<br>')}</span></div>")
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Confirm stimulation parameters")
+        box.setTextFormat(Qt.RichText)
+        box.setText(body)
+        box.setStandardButtons(QMessageBox.Cancel | QMessageBox.Ok)
+        box.button(QMessageBox.Ok).setText("Arm anyway")
+        box.setDefaultButton(QMessageBox.Cancel)
+        self._style_dialog(box)
+        return box
+
+    def _stim_disarm(self, reason=""):
+        if getattr(self, "stim_arm_btn", None) is None:
+            return
+        self.stim_arm_btn.setChecked(False)
+        self.stim_arm_btn.setText("ARM STIM")
+        self.stim_arm_btn.setStyleSheet("background-color: black; color: white")
+        self.stim_send_btn.setEnabled(False)
+        self.stim_send_btn.setStyleSheet("background-color: grey; color: black")
+        self.stim_status_label.setText(
+            f"Stim disarmed{(' - ' + reason) if reason else '.'}")
+
+    def _stim_arm_toggled(self):
+        if not self.stim_arm_btn.isChecked():
+            self._stim_disarm("disarmed by user")
+            return
+
+        if self.ripplestream is None or not self.ripplestream.connected:
+            self.log_status("[Stim] Connect to the processor first.")
+            self._stim_disarm("not connected")
+            return
+
+        params = self._stim_params()
+        errs = params.validate()
+        if errs:
+            self.log_status("[Stim] cannot arm: " + "; ".join(errs))
+            self._stim_disarm("parameters invalid")
+            return
+
+        # Anything that would deliver net DC or an unusually large charge gets
+        # an explicit confirmation rather than a silent send.
+        warns = params.warnings()
+        if warns:
+            box = self._stim_confirm_dialog(params, warns)
+            if box.exec_() != QMessageBox.Ok:
+                self._stim_disarm("cancelled at confirmation")
+                return
+
+        self.stim_arm_btn.setText("ARMED")
+        self.stim_arm_btn.setStyleSheet("background-color: #B00020; color: white; font-weight: bold")
+        self.stim_send_btn.setEnabled(True)
+        self.stim_send_btn.setStyleSheet("background-color: black; color: white")
+        self.stim_status_label.setText("ARMED - SEND TRAIN will deliver current.")
+        self.log_status(f"[Stim] armed: {params.summary()}")
+
+    def _stim_send(self):
+        if not self.stim_arm_btn.isChecked():
+            self.log_status("[Stim] arm before sending.")
+            return
+        params = self._stim_params()
+        try:
+            self.stimulator.send_train(params)
+        except StimParamError as e:
+            self.log_status(f"[Stim] refused: {e}")
+            self._stim_disarm("parameters invalid")
+            return
+        except Exception as e:
+            self.log_status(f"[Stim] send failed: {e}")
+            self._stim_disarm("send failed")
+            return
+
+        self.stim_status_label.setText(
+            f"Train sent - {params.n_pulses} pulses over {params.train_duration_s:.1f} s")
+        # One arm, one train.
+        self._stim_disarm("train sent; re-arm for another")
+
+    def _stim_stop(self):
+        if self.stimulator.stop():
+            self.stim_status_label.setText("STOPPED - stim output disabled.")
+        self._stim_disarm("stopped")
+
+    def _refresh_stim_hardware(self):
+        """Pull the real stim electrode list and uA/step table after connecting."""
+        elecs = self.stimulator.list_stim_electrodes()
+        if not elecs:
+            self.log_status("[Stim] No stim-capable electrodes reported. "
+                            "Stim front end may not be connected.")
+            return
+        self.log_status(f"[Stim] stim electrodes: {elecs}")
+        if getattr(self, "_stim_ui_built", False):
+            self.stim_cathode_spin.setValue(elecs[0])
+            if len(elecs) > 1:
+                self.stim_anode_spin.setValue(elecs[1])
+
+            opts = self.stimulator.resolution_options(elecs[0])
+            if opts:
+                keep = self.stim_res_dropdown.currentIndex()
+                self.stim_res_dropdown.blockSignals(True)
+                self.stim_res_dropdown.clear()
+                for i, ua in enumerate(opts):
+                    self.stim_res_dropdown.addItem(f"{i}: {ua:g} uA/step", ua)
+                self.stim_res_dropdown.setCurrentIndex(
+                    min(keep, self.stim_res_dropdown.count() - 1))
+                self.stim_res_dropdown.blockSignals(False)
+                self.log_status(f"[Stim] resolution options (uA/step): {opts}")
+            self._update_stim_preview()
 
     def _ensure_streaming(self, tag):
         """Calibration needs samples flowing; start the stream if it isn't."""
@@ -1436,26 +1866,7 @@ class RippleGUI(QMainWindow):
         dialog.setWindowTitle("Bar Game Setup")
         dialog.setLabelText("Number of bars:")
         dialog.setTextValue("2")
-        dialog.setStyleSheet("""
-            QInputDialog, QWidget {
-                background-color: black;
-                color: white;
-            }
-            QLineEdit {
-                background-color: #222;
-                color: white;
-                border: 1px solid gray;
-            }
-            QPushButton {
-                background-color: #333;
-                color: white;
-                border: 1px solid gray;
-                padding: 4px 10px;
-            }
-            QPushButton:hover {
-                background-color: #555;
-            }
-        """)
+        self._style_dialog(dialog)
         ok = dialog.exec_()
         if not ok:
             return
@@ -1467,7 +1878,7 @@ class RippleGUI(QMainWindow):
             msg.setIcon(QMessageBox.Warning)
             msg.setWindowTitle('Invalid Input')
             msg.setText('Please enter a valid integer for the number of bars.')
-            msg.setStyleSheet("QLabel { color: white; }")
+            self._style_dialog(msg)
             msg.exec_()
             return
 
@@ -1520,26 +1931,7 @@ class RippleGUI(QMainWindow):
         dialog.setWindowTitle("Cursor Game Setup")
         dialog.setLabelText("Number of channels:")
         dialog.setTextValue("2")
-        dialog.setStyleSheet("""
-            QInputDialog, QWidget {
-                background-color: black;
-                color: white;
-            }
-            QLineEdit {
-                background-color: #222;
-                color: white;
-                border: 1px solid gray;
-            }
-            QPushButton {
-                background-color: #333;
-                color: white;
-                border: 1px solid gray;
-                padding: 4px 10px;
-            }
-            QPushButton:hover {
-                background-color: #555;
-            }
-        """)
+        self._style_dialog(dialog)
         ok = dialog.exec_()
         if not ok:
             return
@@ -1551,7 +1943,7 @@ class RippleGUI(QMainWindow):
             msg.setIcon(QMessageBox.Warning)
             msg.setWindowTitle("Invalid Input")
             msg.setText("Please enter a valid integer.")
-            msg.setStyleSheet("QLabel { color: white; }")
+            self._style_dialog(msg)
             msg.exec_()
             return
 
@@ -1599,6 +1991,11 @@ class RippleGUI(QMainWindow):
         self.active_game.start_game()
 
     def closeEvent(self, event):
+        # Never leave the processor stimulating after the window closes.
+        try:
+            self.stimulator.stop()
+        except Exception:
+            pass
         self._plot_timer.stop()
         self.running = False
         if self.stream is not None:

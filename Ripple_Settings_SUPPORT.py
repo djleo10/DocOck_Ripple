@@ -141,6 +141,70 @@ def muscle_names(n_channels):
 NORM_Y_MIN = -0.2
 NORM_Y_MAX = 1.2
 
+
+# --- stimulation ----------------------------------------------------------
+# Hardware limits, taken from xipppy/stim.py's own property setters. Times in
+# the stim API are in NIP clocks, not microseconds - a very easy way to be off
+# by 33x, so conversions always go through STIM_CLOCK_US.
+STIM_CLOCK_US          = 1e6 / NIP_CLOCK_HZ   # 33.333 us per clock
+STIM_MAX_AMP_STEPS     = 127                  # StimSegment.amplitude
+STIM_MAX_SEG_CLOCKS    = 0xFFFF               # StimSegment.length
+STIM_MAX_PERIOD_CLOCKS = 0xFFFF               # StimSeq.period
+STIM_MAX_REPEATS       = 0xFFF                # StimSeq.repeats (4095)
+STIM_MAX_SEGMENTS      = 249                  # StimSeq.GVSTIM_CMD_MAXLEN
+
+# Charge per phase above which the GUI asks for confirmation. Not a hardware
+# limit - a review prompt, since safe charge density depends on electrode area.
+STIM_CHARGE_WARN_NC    = 400.0
+
+# Defaults mirror Bipolar_Stim_Example.py so the GUI starts from known-good
+# numbers: 80 steps at 20 uA/step = 1600 uA, 200 clocks = 6.67 ms per phase.
+# Shown until the real table is read from the FE via stim_get_res_options().
+# These are the nano/stim front-end steps quoted in Bipolar_Stim_Example.py.
+STIM_FALLBACK_RES_UA = [1.0, 2.0, 5.0, 10.0, 20.0]
+
+STIM_DEFAULTS = dict(
+    cathode_elec=0,
+    anode_elec=1,
+    res_index=4,
+    amp_steps=80,
+    phase_clocks=200,
+    interphase_clocks=100,
+    frequency_hz=1.0,
+    n_pulses=20,
+)
+
+# The main window sets "background-color: black", and Qt cascades that into any
+# dialog parented to it. A dialog that only sets QLabel colour therefore ends up
+# black-on-black. Every dialog gets this instead, which sets its own background
+# as well as the text, inputs and buttons.
+DIALOG_STYLE = """
+QMessageBox, QInputDialog, QDialog {
+    background-color: #1e1e1e;
+}
+QMessageBox QLabel, QInputDialog QLabel, QDialog QLabel {
+    color: #FFFFFF;
+    background-color: transparent;
+    font-size: 13px;
+}
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit {
+    background-color: #2b2b2b;
+    color: #FFFFFF;
+    border: 1px solid #777;
+    padding: 4px;
+}
+QPushButton {
+    background-color: #3a3a3a;
+    color: #FFFFFF;
+    border: 1px solid #8a8a8a;
+    padding: 6px 18px;
+    min-width: 76px;
+}
+QPushButton:hover    { background-color: #555; }
+QPushButton:pressed  { background-color: #222; }
+QPushButton:default  { border: 2px solid #4DB848; }
+"""
+
 # Data Plotting
 EMG_TYPES = {"EMG"}
 NUM_CHANNELS = 6
