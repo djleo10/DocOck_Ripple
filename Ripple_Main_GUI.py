@@ -106,7 +106,11 @@ class RippleGUI(QMainWindow):
 
         # stream_dropdown, not control_dropdown - the latter is the
         # MVC gesture selector built in _mode_select().
-        self.InputSignal_layout = QHBoxLayout()
+        # In its own container so stimulation mode can hide it - the input
+        # stream is a recording control and means nothing while stimulating.
+        self.stream_row = QWidget()
+        self.InputSignal_layout = QHBoxLayout(self.stream_row)
+        self.InputSignal_layout.setContentsMargins(0, 0, 0, 0)
         self.stream_label = QLabel("Input Stream:")
         self.stream_label.setStyleSheet("color: black")
         self.stream_dropdown = QComboBox()
@@ -116,7 +120,7 @@ class RippleGUI(QMainWindow):
             self.stream_dropdown.addItem(STREAM_LABELS.get(canon, canon), canon)
         self.InputSignal_layout.addWidget(self.stream_label)
         self.InputSignal_layout.addWidget(self.stream_dropdown)
-        self.left_layout.addLayout(self.InputSignal_layout)
+        self.left_layout.addWidget(self.stream_row)
 
         # Slot for the mode panel (calibration + stream buttons), claimed here
         # so _mode_select() fills it ABOVE the status box. Appending straight to
@@ -318,6 +322,8 @@ class RippleGUI(QMainWindow):
             # Recording controls make no sense while stimulating, and vice versa.
             self.recording_panel.setVisible(False)
             self.stim_panel.setVisible(True)
+            self.games_panel.setVisible(False)   # games are EMG-driven
+            self.stream_row.setVisible(False)    # recording-only control
             self.view_stack.setCurrentIndex(1)
 
             if not self._stim_ui_built:
@@ -338,6 +344,8 @@ class RippleGUI(QMainWindow):
                 self._stim_disarm("switched to recording")
             self.stim_panel.setVisible(False)
             self.recording_panel.setVisible(True)
+            self.games_panel.setVisible(True)
+            self.stream_row.setVisible(True)
             self.view_stack.setCurrentIndex(0)
 
             # Build the recording controls once - re-clicking the button used to
@@ -616,43 +624,49 @@ class RippleGUI(QMainWindow):
         self.status_signal.connect(self.log_status)
 
     def game_button_display(self):
-        # Game Layout:
+        # Games belong to recording only - the whole block lives in one
+        # container so stimulation mode can hide it in a single call.
+        self.games_panel = QWidget()
+        self.left_layout.addWidget(self.games_panel)
+        self.games_layout = QVBoxLayout(self.games_panel)
+        self.games_layout.setContentsMargins(0, 0, 0, 0)
+
         self.line = QFrame()
         self.line.setFrameShape(QFrame.HLine)
         self.line.setFrameShadow(QFrame.Sunken)
         self.line.setStyleSheet("background-color: black;")
-        self.left_layout.addWidget(self.line)
+        self.games_layout.addWidget(self.line)
 
         self.Game_Label = QLabel()
         self.Game_Label.setText("GAMES")
         self.Game_Label.setStyleSheet("font-size: 18px; font-weight: bold; color: black")
         self.Game_Label.setAlignment(Qt.AlignCenter)
-        self.left_layout.addWidget(self.Game_Label)
+        self.games_layout.addWidget(self.Game_Label)
 
         self.bargame_btn = QPushButton("Bar Game")
         self.bargame_btn.clicked.connect(self.bargame_v2)
         self.bargame_btn.setStyleSheet("background-color: black; color: white")
-        self.left_layout.addWidget(self.bargame_btn)
+        self.games_layout.addWidget(self.bargame_btn)
 
         self.blockgame_btn = QPushButton("Block Game")
         self.blockgame_btn.clicked.connect(self.blockgame_v1)
         self.blockgame_btn.setStyleSheet("background-color: black; color: white")
-        self.left_layout.addWidget(self.blockgame_btn)
+        self.games_layout.addWidget(self.blockgame_btn)
 
         self.cursorgame_btn = QPushButton("Cursor Game")
         self.cursorgame_btn.clicked.connect(self.cursorgame_v1)
         self.cursorgame_btn.setStyleSheet("background-color: black; color: white")
-        self.left_layout.addWidget(self.cursorgame_btn)
+        self.games_layout.addWidget(self.cursorgame_btn)
 
         self.spacegame_btn = QPushButton("Space Game")
         self.spacegame_btn.clicked.connect(self.spacegame)
         self.spacegame_btn.setStyleSheet("background-color: black; color: white")
-        self.left_layout.addWidget(self.spacegame_btn)
+        self.games_layout.addWidget(self.spacegame_btn)
 
         self.jetpackgame_btn = QPushButton("Jetpack Game")
         self.jetpackgame_btn.clicked.connect(self.jetpackgame)
         self.jetpackgame_btn.setStyleSheet("background-color: black; color: white")
-        self.left_layout.addWidget(self.jetpackgame_btn)
+        self.games_layout.addWidget(self.jetpackgame_btn)
 
     def _style_dialog(self, dialog):
         """
@@ -729,29 +743,43 @@ class RippleGUI(QMainWindow):
         page = QWidget()
         lay = QVBoxLayout(page)
 
-        self.stim_pulse_plot = pqtg.PlotWidget()
-        self.stim_pulse_plot.setBackground('k')
-        self.stim_pulse_plot.setLabel('left', 'Current', units='uA')
-        self.stim_pulse_plot.setLabel('bottom', 'Time', units='ms')
-        self.stim_pulse_plot.setTitle('Single pulse', color='w')
-        self.stim_pulse_plot.showGrid(x=True, y=True, alpha=0.3)
-        self.stim_pulse_plot.addLine(y=0, pen=pqtg.mkPen('#666', width=1))
+        def make_plot(title, xlabel):
+            # Units go in the label TEXT, not the units= kwarg: pyqtgraph
+            # SI-prefixes the unit string, so units='ms' turns a 19 s train into
+            # "kms" and units='uA' into "muA".
+            pw = pqtg.PlotWidget()
+            pw.setBackground('k')
+            pw.setTitle(title, color='w', size='11pt')
+            pw.setLabel('left', 'Current (uA)', color='#BBBBBB')
+            pw.setLabel('bottom', xlabel, color='#BBBBBB')
+            pw.showGrid(x=True, y=True, alpha=0.25)
+            pw.getPlotItem().getViewBox().setDefaultPadding(0.0)
+            # ignoreBounds keeps this infinite-extent line out of autoRange,
+            # which otherwise fights the explicit ranges set on every update.
+            zero = pqtg.InfiniteLine(pos=0, angle=0,
+                                     pen=pqtg.mkPen('#777', width=1))
+            pw.addItem(zero, ignoreBounds=True)
+            return pw
+
+        self.stim_pulse_plot = make_plot('Single pulse', 'Time (us)')
         self.stim_pulse_cath = self.stim_pulse_plot.plot(
-            pen=pqtg.mkPen('#00E5FF', width=2), name='cathode-leading')
+            pen=pqtg.mkPen('#00E5FF', width=2))
         self.stim_pulse_anod = self.stim_pulse_plot.plot(
             pen=pqtg.mkPen('#FF6D00', width=2, style=Qt.DashLine))
 
-        self.stim_train_plot = pqtg.PlotWidget()
-        self.stim_train_plot.setBackground('k')
-        self.stim_train_plot.setLabel('left', 'Current', units='uA')
-        self.stim_train_plot.setLabel('bottom', 'Time', units='ms')
-        self.stim_train_plot.setTitle('Pulse train', color='w')
-        self.stim_train_plot.showGrid(x=True, y=True, alpha=0.3)
-        self.stim_train_plot.addLine(y=0, pen=pqtg.mkPen('#666', width=1))
+        self.stim_train_plot = make_plot('Pulse train', 'Time (ms)')
         self.stim_train_cath = self.stim_train_plot.plot(
             pen=pqtg.mkPen('#00E5FF', width=1))
         self.stim_train_anod = self.stim_train_plot.plot(
             pen=pqtg.mkPen('#FF6D00', width=1, style=Qt.DashLine))
+
+        legend = QLabel(
+            "<span style='color:#00E5FF;'>&#9473;&#9473; cathode electrode</span>"
+            "&nbsp;&nbsp;&nbsp;"
+            "<span style='color:#FF6D00;'>&#9476;&#9476; anode electrode</span>"
+            "&nbsp;&nbsp;&nbsp;"
+            "<span style='color:#999999;'>(bipolar pair: exact mirrors)</span>")
+        legend.setStyleSheet("background-color: transparent;")
 
         self.stim_readout = QLabel("No stimulation parameters yet.")
         self.stim_readout.setStyleSheet(
@@ -760,6 +788,7 @@ class RippleGUI(QMainWindow):
 
         lay.addWidget(self.stim_pulse_plot, stretch=2)
         lay.addWidget(self.stim_train_plot, stretch=3)
+        lay.addWidget(legend)
         lay.addWidget(self.stim_readout)
         return page
 
@@ -897,7 +926,23 @@ class RippleGUI(QMainWindow):
         mirrored = (state == Qt.Checked)
         self.stim_anod_phase_spin.setEnabled(not mirrored)
         self.stim_anod_amp_spin.setEnabled(not mirrored)
+        self._sync_mirrored_phase()
         self._update_stim_preview()
+
+    def _sync_mirrored_phase(self):
+        """
+        While mirroring, show the values actually in use. Otherwise the 2nd
+        phase boxes keep whatever was last typed and read as if they applied -
+        e.g. '6666.7 us' next to a 200000 us first phase.
+        """
+        if not getattr(self, "stim_mirror_check", None) or \
+                not self.stim_mirror_check.isChecked():
+            return
+        for src, dst in ((self.stim_phase_spin, self.stim_anod_phase_spin),
+                         (self.stim_amp_spin, self.stim_anod_amp_spin)):
+            dst.blockSignals(True)
+            dst.setValue(src.value())
+            dst.blockSignals(False)
 
     def _on_stim_ramp_changed(self, state):
         self.stim_ramp_end_spin.setEnabled(state == Qt.Checked)
@@ -926,10 +971,49 @@ class RippleGUI(QMainWindow):
             ramp_end_steps=self.stim_ramp_end_spin.value() if ramping else None,
         )
 
+    @staticmethod
+    def _time_scale(t_ms):
+        """
+        Pick us / ms / s so the numbers stay readable. A 500 ms pulse shown in
+        us reads '675000' on the axis; a 2 us phase shown in ms reads '0.002'.
+        Returns (multiplier applied to a ms array, axis label).
+        """
+        span = float(np.max(np.abs(t_ms))) if len(t_ms) else 0.0
+        if span < 2.0:
+            return 1000.0, 'Time (us)'
+        if span < 2000.0:
+            return 1.0, 'Time (ms)'
+        return 0.001, 'Time (s)'
+
+    def _fit_stim_axes(self, plot, t, *series):
+        """
+        Pin both axes to the data. Auto-range leaves the trace floating in a
+        window that doesn't match it; this makes the x-axis span exactly the
+        rendered length and the y-axis symmetric about 0 so cathodic and
+        anodic phases are visually comparable.
+        """
+        vb = plot.getPlotItem().getViewBox()
+        vb.disableAutoRange()
+        if t is None or len(t) == 0:
+            return
+        x0, x1 = float(np.min(t)), float(np.max(t))
+        if x1 <= x0:
+            x1 = x0 + 1.0
+        plot.setXRange(x0, x1, padding=0)
+
+        peak = 0.0
+        for s in series:
+            if s is not None and len(s):
+                peak = max(peak, float(np.max(np.abs(s))))
+        if peak <= 0:
+            peak = 1.0
+        plot.setYRange(-peak * 1.15, peak * 1.15, padding=0)
+
     def _update_stim_preview(self, *_):
         """Redraw both panes and the readout from the current parameters."""
         if not getattr(self, "_stim_ui_built", False):
             return
+        self._sync_mirrored_phase()
         params = self._stim_params()
         errs = params.validate()
 
@@ -943,15 +1027,35 @@ class RippleGUI(QMainWindow):
             self._stim_disarm("parameters invalid")
             return
 
+        # --- single pulse ---
         tp, yp = self.stimulator.render_single_pulse(params, 'cathode')
         _, ypa = self.stimulator.render_single_pulse(params, 'anode')
+        k, xlabel = self._time_scale(tp)
+        tp = tp * k
         self.stim_pulse_cath.setData(tp, yp)
         self.stim_pulse_anod.setData(tp, ypa)
+        self.stim_pulse_plot.setLabel('bottom', xlabel, color='#BBBBBB')
+        self.stim_pulse_plot.setTitle(
+            f"Single pulse - {params.phase_us:.0f} us per phase, "
+            f"{params.interphase_us:.0f} us gap", color='w', size='11pt')
+        self._fit_stim_axes(self.stim_pulse_plot, tp, yp, ypa)
 
+        # --- whole train ---
         tt, yt = self.stimulator.render_waveform(params, 'cathode')
         _, yta = self.stimulator.render_waveform(params, 'anode')
+        k, xlabel = self._time_scale(tt)
+        tt = tt * k
         self.stim_train_cath.setData(tt, yt)
         self.stim_train_anod.setData(tt, yta)
+        self.stim_train_plot.setLabel('bottom', xlabel, color='#BBBBBB')
+        self.stim_train_plot.setTitle(
+            f"Pulse train - {params.n_pulses} pulse"
+            f"{'s' if params.n_pulses != 1 else ''} at "
+            f"{params.actual_frequency_hz:.3g} Hz over "
+            f"{params.train_duration_s:.3g} s"
+            + ("   (single pulse: same as above)" if params.n_pulses == 1 else ""),
+            color='w', size='11pt')
+        self._fit_stim_axes(self.stim_train_plot, tt, yt, yta)
 
         warns = params.warnings()
         text = (
@@ -968,6 +1072,12 @@ class RippleGUI(QMainWindow):
         self.stim_readout.setStyleSheet(
             ("color: #FFD180; " if warns else "color: white; ")
             + "background-color: #1e1e1e; padding: 6px;")
+
+        # Clear a stale "parameters invalid" left over from mid-edit: the
+        # parameters are valid again by the time we get here.
+        if not self.stim_arm_btn.isChecked() \
+                and "invalid" in self.stim_status_label.text():
+            self.stim_status_label.setText("Stim disarmed.")
 
     def _stim_confirm_dialog(self, params, warns):
         """

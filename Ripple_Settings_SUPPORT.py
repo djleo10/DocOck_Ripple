@@ -194,15 +194,20 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit {
     padding: 4px;
 }
 QPushButton {
-    background-color: #3a3a3a;
-    color: #FFFFFF;
-    border: 1px solid #8a8a8a;
-    padding: 6px 18px;
-    min-width: 76px;
+    background-color: #E8E8E8;
+    color: #101010;
+    border: 1px solid #FFFFFF;
+    border-radius: 3px;
+    padding: 7px 20px;
+    min-width: 88px;
+    font-weight: bold;
 }
-QPushButton:hover    { background-color: #555; }
-QPushButton:pressed  { background-color: #222; }
-QPushButton:default  { border: 2px solid #4DB848; }
+QPushButton:hover    { background-color: #FFFFFF; }
+QPushButton:pressed  { background-color: #BDBDBD; }
+/* Dark text on the green: white on #4DB848 is only 2.5:1, below AA. */
+QPushButton:default  { background-color: #4DB848; color: #0A2A0A;
+                       border: 2px solid #A5F5A0; }
+QPushButton:focus    { border: 2px solid #4DB848; }
 """
 
 # Data Plotting
