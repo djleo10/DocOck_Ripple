@@ -74,8 +74,8 @@ def send_stim(max_stim_count):
     Parameters:
         max_stim_count: Maximum number of stimulations to perform
     """
-    stim_wave_cathode = stim_waveform(is_cathode=True, stim_channel=0, pulse_width=200, stim_mag_steps=100, stim_res=4)
-    stim_wave_anode = stim_waveform(is_cathode=False, stim_channel=1, pulse_width=200, stim_mag_steps=100, stim_res=4)
+    stim_wave_cathode = stim_waveform(is_cathode=True, stim_channel=0, pulse_width=200, stim_mag_steps=127, stim_res=4)
+    stim_wave_anode = stim_waveform(is_cathode=False, stim_channel=1, pulse_width=200, stim_mag_steps=127, stim_res=4)
     stim_count = 0
 
     while stim_count < max_stim_count:

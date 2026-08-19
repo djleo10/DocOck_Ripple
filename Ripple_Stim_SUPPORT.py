@@ -360,9 +360,13 @@ class RippleStimulator:
         if errs:
             raise StimParamError("; ".join(errs))
 
+        # cathodic_first decides which phase the CATHODE electrode leads with;
+        # the anode electrode always leads with the opposite so current flows
+        # between the pair. Unticking the box flips both channels.
+        lead = params.cathodic_first
         seqs = []
-        for leading_cathodic, elec in ((True, params.cathode_elec),
-                                       (False, params.anode_elec)):
+        for leading_cathodic, elec in ((lead, params.cathode_elec),
+                                       (not lead, params.anode_elec)):
             if not params.uses_explicit_segments:
                 segs = self._pulse_segments(params, params.amp_steps, leading_cathodic)
                 seq = xp.StimSeq(elec, params.period_clocks, params.n_pulses,
@@ -389,7 +393,10 @@ class RippleStimulator:
         (t_ms, i_uA) for one channel of the pair, built from the same segment
         description that gets sent. Returns the full train.
         """
-        leading_cathodic = (channel == 'cathode')
+        # Same rule as build_sequences: the cathode electrode leads with the
+        # phase cathodic_first selects, the anode electrode with the opposite.
+        leading_cathodic = (params.cathodic_first if channel == 'cathode'
+                            else not params.cathodic_first)
         schedule = params.amplitude_schedule()
         if not schedule:
             return np.zeros(0), np.zeros(0)
@@ -431,9 +438,12 @@ class RippleStimulator:
             t, y = t[keep], y[keep]
         return t, y
 
-    def render_single_pulse(self, params, channel='cathode', pad_frac=0.35):
+    def render_single_pulse(self, params, channel='cathode', pad_frac=0.08):
         """(t_ms, i_uA) for just the first pulse, padded either side."""
-        leading_cathodic = (channel == 'cathode')
+        # Same rule as build_sequences: the cathode electrode leads with the
+        # phase cathodic_first selects, the anode electrode with the opposite.
+        leading_cathodic = (params.cathodic_first if channel == 'cathode'
+                            else not params.cathodic_first)
         amp = params.amplitude_schedule()[0] if params.n_pulses else params.amp_steps
         a_steps = (amp if params.anodic_amp_steps is None
                    else int(params.anodic_amp_steps))
